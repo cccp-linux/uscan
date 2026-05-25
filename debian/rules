@@ -1,0 +1,21 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	dh_auto_build
+	$(MAKE) -f debian/rules scripts/uscan.1
+	$(MAKE) -f debian/rules scripts/uscan-templates.5
+
+override_dh_auto_clean:
+	dh_auto_clean
+	rm -f scripts/uscan.1 scripts/uscan-templates.5
+
+%.1: %.pl
+	podchecker $<
+	pod2man --utf8 --center=" " --release="Debian Utilities" $< > $@
+
+%.5: %.pod
+	podchecker $<
+	pod2man --utf8 --center=" " --release="Debian Utilities" --section=5 $< > $@

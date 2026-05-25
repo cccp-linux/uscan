@@ -1,0 +1,5 @@
+#!/usr/bin/dh-exec
+
+lib/Devscripts usr/share/perl5/
+scripts/uscan.pl => usr/bin/uscan
+scripts/uscan.bash_completion => usr/share/bash-completion/completions/uscan
