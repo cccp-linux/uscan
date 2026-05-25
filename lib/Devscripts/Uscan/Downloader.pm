@@ -1,0 +1,354 @@
+package Devscripts::Uscan::Downloader;
+
+use strict;
+use Cwd qw/cwd abs_path/;
+use Devscripts::Uscan::CatchRedirections;
+use Devscripts::Uscan::Output;
+use Devscripts::Uscan::Utils;
+use Dpkg::IPC;
+use File::DirList;
+use File::Find;
+use File::Temp qw/tempdir/;
+use File::Touch;
+use Moo;
+use URI;
+
+our $haveSSL;
+
+has git_upstream => (is => 'rw');
+
+BEGIN {
+    eval { require LWP::UserAgent; };
+    if ($@) {
+        my $progname = basename($0);
+        if ($@ =~ /^Can\'t locate LWP\/UserAgent\.pm/) {
+            die "$progname: you must have the libwww-perl package installed\n"
+              . "to use this script";
+        } else {
+            die "$progname: problem loading the LWP::UserAgent module:\n  $@\n"
+              . "Have you installed the libwww-perl package?";
+        }
+    }
+    eval { require LWP::Protocol::https; };
+    $haveSSL = $@ ? 0 : 1;
+}
+
+has agent =>
+  (is => 'rw', default => sub { "Debian uscan $main::uscan_version" });
+has timeout => (is => 'rw');
+has destdir => (is => 'rw');
+
+# 0: no repo, 1: shallow clone, 2: full clone
+has gitrepo_state => (
+    is      => 'rw',
+    default => sub { 0 });
+has git_export_all => (
+    is      => 'rw',
+    default => sub { 0 });
+has user_agent => (
+    is      => 'rw',
+    lazy    => 1,
+    default => sub {
+        my ($self) = @_;
+        my $user_agent
+          = Devscripts::Uscan::CatchRedirections->new(env_proxy => 1);
+        $user_agent->timeout($self->timeout);
+        $user_agent->agent($self->agent);
+
+        # Strip Referer header for Sourceforge to avoid SF sending back a
+        # "200 OK" with a <meta refresh=...> redirect
+        $user_agent->add_handler(
+            'request_prepare' => sub {
+                my ($request, $ua, $h) = @_;
+                $request->remove_header('Referer');
+            },
+            m_hostname => 'sourceforge.net',
+        );
+        $self->{user_agent} = $user_agent;
+    });
+
+has ssl => (is => 'rw', default => sub { $haveSSL });
+
+has headers => (
+    is      => 'ro',
+    default => sub { {} });
+
+sub download ($$$$$$$$) {
+    my (
+        $self,    $url, $fname, $optref, $base,
+        $pkg_dir, $pkg, $mode,  $gitrepo_dir
+    ) = @_;
+    my ($request, $response);
+    $mode ||= $optref->mode;
+    if ($mode eq 'http') {
+        if ($url =~ /^https/ and !$self->ssl) {
+            uscan_die "$progname: you must have the "
+              . "liblwp-protocol-https-perl package installed\n"
+              . "to use https URLs";
+        }
+
+        # substitute HTML entities
+        # Is anything else than "&amp;" required?  I doubt it.
+        uscan_verbose "Requesting URL:\n   $url";
+        my $headers = HTTP::Headers->new;
+        $headers->header('Accept'  => '*/*');
+        $headers->header('Referer' => $base);
+        my $uri_o = URI->new($url);
+        foreach my $k (keys %{ $self->headers }) {
+            if ($k =~ /^(.*?)@(.*)$/) {
+                my $baseUrl = $1;
+                my $hdr     = $2;
+                if ($url =~ m#^\Q$baseUrl\E(?:/.*)?$#) {
+                    $headers->header($hdr => $self->headers->{$k});
+                    uscan_verbose "Set per-host custom header $hdr for $url";
+                } else {
+                    uscan_debug "$url does not start with $1";
+                }
+            } else {
+                uscan_warn "Malformed http-header: $k";
+            }
+        }
+        $request  = HTTP::Request->new('GET', $url, $headers);
+        $response = $self->user_agent->request($request, $fname);
+        if (!$response->is_success) {
+            uscan_warn((defined $pkg_dir ? "In directory $pkg_dir, d" : "D")
+                . "ownloading\n  $url failed: "
+                  . $response->status_line);
+            return 0;
+        }
+    } elsif ($mode eq 'ftp' or $mode eq 'metacpan' or $mode eq 'gitlab') {
+        uscan_verbose "Requesting URL:\n   $url";
+        $request  = HTTP::Request->new('GET', "$url");
+        $response = $self->user_agent->request($request, $fname);
+        if (!$response->is_success) {
+            uscan_warn(
+                  (defined $pkg_dir ? "In directory $pkg_dir, d" : "D")
+                . "ownloading\n  $url failed: "
+                  . $response->status_line);
+            return 0;
+        }
+    } else {    # $mode eq 'svn' or $mode eq 'git'
+        my $destdir = $self->destdir;
+        my $curdir  = cwd();
+        $fname
+          =~ m%(.*)/\Q$pkg\E[-_]([^_/]*)\.tar(?:\.(gz|xz|bz2|lzma|zstd?))?%;
+        my $dst     = $1;
+        my $abs_dst = abs_path($dst);
+        my $ver     = $2;
+        my $suffix  = $3;
+        my ($gitrepo, $gitref) = split /[[:space:]]+/, $url, 2;
+        my $clean = sub {
+            uscan_exec_no_fail('rm', '-fr', $gitrepo_dir);
+        };
+        my $clean_and_die = sub {
+            $clean->();
+            uscan_die @_;
+        };
+
+        if ($mode eq 'svn') {
+            my $tempdir   = tempdir(CLEANUP => 1);
+            my $old_umask = umask(oct('022'));
+            uscan_exec('svn', 'export', $url, "$tempdir/$pkg-$ver");
+            umask($old_umask);
+            find({
+                    wanted => sub {
+                        return if !-d $File::Find::name;
+                        my ($newest) = grep { $_ ne '.' && $_ ne '..' }
+                          map { $_->[13] } @{ File::DirList::list($_, 'M') };
+                        return if !$newest;
+                        my $touch
+                          = File::Touch->new(reference => $_ . '/' . $newest);
+                        $touch->touch($_);
+                    },
+                    bydepth  => 1,
+                    no_chdir => 1,
+                },
+                "$tempdir/$pkg-$ver"
+            );
+            uscan_exec(
+                'tar',          '-C',
+                $tempdir,       '--sort=name',
+                '--owner=root', '--group=root',
+                '-cvf',         "$abs_dst/$pkg-$ver.tar",
+                "$pkg-$ver"
+            );
+        } else {
+            my @git = ('git');
+            push(@git, '--git-dir=.')
+              if not $optref->git->{modules}
+              and not $self->git_upstream;
+            my @attr_files;
+
+            if (!$self->git_upstream) {
+                # clone main repository
+                if ($self->gitrepo_state == 0) {
+                    my @opts = ();
+                    push(@opts, '--quiet') if not $verbose;
+                    push(@opts, '--bare')  if not $optref->git->{modules};
+
+                    if ($optref->git->{mode} eq 'shallow') {
+                        my $tag = $gitref;
+                        $tag =~ s#^refs/(?:tags|heads)/##;
+                        push(@opts, '--depth=1', '-b', $tag);
+                        $self->gitrepo_state(1);
+                    } else {
+                        $self->gitrepo_state(2);
+                    }
+                    uscan_exec('git', 'clone', @opts, $base,
+                        "$destdir/$gitrepo_dir");
+                }
+                # clone submodules
+                if ($optref->git->{modules}) {
+                    my @opts = ();
+                    push(@opts, '--quiet') if not $verbose;
+                    push(@opts, qw/update --init --recursive/);
+                    push(@opts, '--depth=1') if $self->gitrepo_state == 1;
+                    push(@opts, '--');
+                    foreach my $m (@{ $optref->git->{modules} }) {
+                        push(@opts, "$m");
+                    }
+                    chdir "$destdir/$gitrepo_dir";
+                    uscan_exec('git', 'submodule', @opts);
+                }
+
+                chdir "$destdir/$gitrepo_dir"
+                  or $clean_and_die->(
+                    "Unable to chdir($destdir/$gitrepo_dir): $!");
+            }
+
+            if ($self->git_export_all) {
+                my @info_dirs;
+                my @arr_refs = (\@info_dirs, \@attr_files);
+                my @gitpaths = ("info/", "info/attributes");
+
+                for (my $tmp, my $i = 0 ; $i < @gitpaths ; $i++) {
+                    my @cmd = ("rev-parse", "--git-path", ${ gitpaths [$i] });
+                    uscan_debug join(' ', @git, @cmd);
+                    spawn(
+                        exec      => [@git, @cmd],
+                        to_string => \$tmp,
+                    );
+                    chomp $tmp;
+                    push(@{ $arr_refs[$i] }, split(/\n/, $tmp));
+
+                    if ($optref->git->{modules}) {
+                        my @git_sm
+                          = qw/git submodule --quiet foreach --recursive git/;
+                        uscan_debug join(' ', @git_sm, @cmd);
+                        spawn(
+                            exec      => [@git_sm, @cmd],
+                            to_string => \$tmp,
+                        );
+                        chomp $tmp;
+                        push(@{ $arr_refs[$i] }, split(/\n/, $tmp));
+                    }
+                }
+
+                foreach my $infodir (@info_dirs) {
+                    mkdir $infodir unless -e $infodir;
+                }
+
+                # override any export-subst and export-ignore attributes
+                foreach my $attr_file (@attr_files) {
+                    if ($self->git_upstream) {
+                        rename($attr_file, "$attr_file-uscan")
+                          if -e $attr_file;
+                    }
+
+                    my $attr_fh;
+                    open($attr_fh, '>', $attr_file);
+                    print $attr_fh "* -export-subst\n* -export-ignore\n";
+                    close $attr_fh;
+                }
+            }
+
+            # archive main repository
+            uscan_exec_no_fail(@git, 'archive', '--format=tar',
+                "--prefix=$pkg-$ver/",
+                "--output=$abs_dst/$pkg-$ver.tar", $gitref) == 0
+              or $clean_and_die->("$gitrepo_dir", "git archive failed");
+
+            # archive submodules, append to main tarball, clean up
+            if ($optref->git->{modules}) {
+                my @sm_deinit;
+
+                if (    $self->git_upstream
+                    and $optref->git->{modules}->[0] ne '.') {
+                    my @cmd = (
+                        'git', 'submodule', '--quiet', 'foreach',
+                        'echo $name'
+                    );
+                    my $tmp;
+                    uscan_debug join(' ', @cmd);
+                    spawn(
+                        exec       => [@cmd],
+                        to_string  => \$tmp,
+                        wait_child => 1,
+                        no_check   => 1,
+                      # XXX: Backwards compatibility, remove after dpkg 1.24.0.
+                        nocheck => 1,
+                    );
+                    chomp $tmp;
+                    my @sm_active = (split '\n', $tmp);
+                    my %sm_wanted;
+                    @sm_wanted{ @{ $optref->git->{modules} } } = 1;
+                    @sm_deinit = grep { !exists $sm_wanted{$_} } @sm_active;
+                    uscan_exec_no_fail('git', 'submodule', '--quiet',
+                        'deinit', '--', @sm_deinit);
+                }
+
+                my $cmd = join ' ',
+                  "git archive --format=tar --prefix=$pkg-$ver/\$displaypath/",
+                  "--output=$abs_dst/\$sha1.tar HEAD",
+                  "&& tar -Af $abs_dst/$pkg-$ver.tar $abs_dst/\$sha1.tar",
+                  "&& rm $abs_dst/\$sha1.tar";
+
+                uscan_exec_no_fail('git', 'submodule', 'foreach',
+                    '--recursive', $cmd) == 0
+                  or $clean_and_die->("git archive (submodules) failed");
+
+                if (    $self->git_upstream
+                    and $optref->git->{modules}->[0] ne '.') {
+                    uscan_exec_no_fail('git', 'submodule', '--quiet',
+                        'update', '--init', '--', @sm_deinit);
+                }
+            }
+
+            if ($self->git_upstream and $self->git_export_all) {
+                # restore attributes
+                foreach my $attr_file (@attr_files) {
+                    (-e "$attr_file-uscan")
+                      ? rename("$attr_file-uscan", $attr_file)
+                      : unlink $attr_file;
+                }
+            }
+
+            chdir "$curdir"
+              or $clean_and_die->("Unable to chdir($curdir): $!");
+        }
+
+        if (defined($suffix)) {
+            chdir "$abs_dst"
+              or $clean_and_die->("Unable to chdir($abs_dst): $!");
+            if ($suffix eq 'gz') {
+                uscan_exec("gzip", "-n", "-9", "$pkg-$ver.tar");
+            } elsif ($suffix eq 'xz') {
+                uscan_exec("xz", "$pkg-$ver.tar");
+            } elsif ($suffix eq 'bz2') {
+                uscan_exec("bzip2", "$pkg-$ver.tar");
+            } elsif ($suffix eq 'lzma') {
+                uscan_exec("lzma", "$pkg-$ver.tar");
+                #} elsif ($suffix =~ /^zstd?$/) {
+                #    uscan_exec("zstd", "$pkg-$ver.tar");
+            } else {
+                $clean_and_die->("Unknown suffix file to repack: $suffix");
+            }
+            chdir "$curdir"
+              or $clean_and_die->("Unable to chdir($curdir): $!");
+        }
+        $clean->();
+    }
+    return 1;
+}
+
+1;
