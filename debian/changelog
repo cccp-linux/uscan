@@ -1,3 +1,9 @@
+uscan (2.26.9.1) unstable; urgency=medium
+
+  * d/control: depend on libio-string-perl
+
+ -- Dimitry Ishenko <dimitry.ishenko@gmail.com>  Wed, 22 Jul 2026 18:45:54 -0400
+
 uscan (2.26.9) unstable; urgency=medium
 
   * Add Debian release workflow
