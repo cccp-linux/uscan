@@ -1,3 +1,9 @@
+uscan (2.26.9.2) unstable; urgency=medium
+
+  * d/control: depend on libjson-perl (gitlab)
+
+ -- Dimitry Ishenko <dimitry.ishenko@gmail.com>  Wed, 22 Jul 2026 20:42:06 -0400
+
 uscan (2.26.9.1) unstable; urgency=medium
 
   * d/control: depend on libio-string-perl
